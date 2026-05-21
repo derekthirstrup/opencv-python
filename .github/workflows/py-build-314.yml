@@ -1,0 +1,191 @@
+name: Build opencv-python-headless Python 3.14t Wheel
+
+# Thin fork build that applies opencv/opencv-python#1051 (a one-line
+# setup.py patch that disables -DPYTHON3_LIMITED_API when Py_GIL_DISABLED
+# is set) and produces a real cp314t-tagged wheel instead of abi3. This
+# is what makes the wheel actually loadable on Windows free-threaded
+# CPython (where python3.dll is not present, so abi3 wheels fail with
+# "DLL load failed: specified module could not be found").
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "opencv-python upstream tag (defaults to 92 = PyPI 4.13.0.92)"
+        required: true
+        default: "92"
+      package_version:
+        description: "PyPI version string this corresponds to (used in wheel filename)"
+        required: true
+        default: "4.13.0.92"
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }} opencv-python-headless cp314t
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform_tag: "win_amd64"
+          # Linux deferred — manylinux repair for opencv is involved
+          # (lots of bundled libs); add when there's actual demand.
+    env:
+      OPENCV_TAG: ${{ inputs.version }}
+      OPENCV_PACKAGE_VERSION: ${{ inputs.package_version }}
+      PYTHON_VERSION: "cpython-3.14t"
+      ENABLE_HEADLESS: "1"
+      ENABLE_CONTRIB: "0"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install Python 3.14t
+        shell: bash
+        run: uv python install "$PYTHON_VERSION"
+
+      - name: Clone opencv-python with submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          workdir="$RUNNER_TEMP/opencv-python-build"
+          echo "Cloning opencv/opencv-python at tag $OPENCV_TAG"
+          git clone --recursive --depth 1 --shallow-submodules \
+              --branch "$OPENCV_TAG" \
+              https://github.com/opencv/opencv-python.git "$workdir"
+          du -sh "$workdir"
+
+      # The one-line PR #1051 patch: make -DPYTHON3_LIMITED_API conditional
+      # on Py_GIL_DISABLED so free-threaded builds disable the Limited API
+      # and produce a real cp314t-tagged binary. opencv-python's setup.py
+      # already imports sysconfig, so no other changes needed.
+      - name: Patch setup.py to disable Limited API on free-threaded
+        shell: bash
+        run: |
+          set -euo pipefail
+          workdir="$RUNNER_TEMP/opencv-python-build"
+          before=$(grep -n 'PYTHON3_LIMITED_API=ON' "$workdir/setup.py" || true)
+          echo "--- before ---"
+          echo "$before"
+          sed -i.bak \
+              's|"-DPYTHON3_LIMITED_API=ON"|"-DPYTHON3_LIMITED_API=%s" % ("OFF" if sysconfig.get_config_var("Py_GIL_DISABLED") else "ON")|' \
+              "$workdir/setup.py"
+          rm -f "$workdir/setup.py.bak"
+          echo "--- after ---"
+          grep -n 'PYTHON3_LIMITED_API' "$workdir/setup.py"
+
+      - name: Build wheel (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $workdir = "$env:RUNNER_TEMP\opencv-python-build"
+          Set-Location "$workdir"
+
+          # Create a cp314t venv with build deps. Cython pin matches what
+          # cupy/fastrlock used; opencv-python's actual build deps come
+          # from its own pyproject.toml.
+          uv venv --python="$env:PYTHON_VERSION" .venv
+          uv pip install --python .venv\Scripts\python.exe `
+              "cython>=3.1,<3.2" "setuptools>=70" wheel build `
+              "scikit-build>=0.18" numpy cmake ninja
+
+          # ENABLE_HEADLESS makes setup.py produce opencv-python-headless
+          # (the variant BFS2 depends on).
+          $env:ENABLE_HEADLESS = "1"
+          $env:ENABLE_CONTRIB = "0"
+
+          # opencv-python's setup.py reads MAKEFLAGS / CMAKE_ARGS too.
+          # Limit parallel jobs to avoid OOM on 7 GB runners.
+          $env:CMAKE_BUILD_PARALLEL_LEVEL = "4"
+
+          Write-Host "Starting opencv build — expect 20-40 min..."
+          .venv\Scripts\python.exe -m build --wheel --no-isolation --outdir dist
+
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\dist" | Out-Null
+          Copy-Item dist\*.whl "$env:GITHUB_WORKSPACE\dist\"
+
+      - name: List built wheel
+        shell: bash
+        run: |
+          ls -la "$GITHUB_WORKSPACE/dist/"
+          # Confirm the wheel is actually cp314t-tagged (not abi3)
+          for whl in "$GITHUB_WORKSPACE/dist"/*.whl; do
+            echo "Filename: $(basename "$whl")"
+            case "$(basename "$whl")" in
+              *cp314t*) echo "  ✓ cp314t-tagged" ;;
+              *abi3*)   echo "  ✗ STILL abi3 — patch didn't take" ; exit 1 ;;
+              *)        echo "  ? unknown tag" ;;
+            esac
+          done
+
+      # Real smoke test: install in a fresh cp314t venv and import cv2.
+      # If the abi3-vs-cp314t fix worked, this load should succeed where
+      # the retagged-abi3 wheel failed with "DLL load failed."
+      - name: Smoke test wheel (import cv2)
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke_venv="$RUNNER_TEMP/smoke-venv"
+          uv venv --python="$PYTHON_VERSION" "$smoke_venv"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            uv pip install --python "$smoke_venv/Scripts/python.exe" "$GITHUB_WORKSPACE"/dist/*.whl
+            "$smoke_venv/Scripts/python.exe" -I -c "import cv2; print('cv2 ok, version', cv2.__version__)"
+          else
+            uv pip install --python "$smoke_venv/bin/python" "$GITHUB_WORKSPACE"/dist/*.whl
+            "$smoke_venv/bin/python" -I -c "import cv2; print('cv2 ok, version', cv2.__version__)"
+          fi
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencv-python-headless-${{ matrix.platform_tag }}-cp314t-wheel
+          path: dist/*.whl
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish wheels to GitHub Release
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      OPENCV_PACKAGE_VERSION: ${{ inputs.package_version }}
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: wheels
+          pattern: opencv-python-headless-*-wheel
+          merge-multiple: true
+
+      - name: List downloaded wheels
+        run: ls -la wheels/
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.OPENCV_PACKAGE_VERSION }}+py314
+          name: opencv-python-headless ${{ env.OPENCV_PACKAGE_VERSION }}+py314 (cp314t)
+          body: |
+            Free-threading-compatible (cp314t) wheels for
+            `opencv-python-headless`, built with the one-line patch from
+            opencv/opencv-python#1051:
+
+                -DPYTHON3_LIMITED_API=OFF when Py_GIL_DISABLED is set
+
+            This produces a real cp314t-tagged binary instead of abi3, so it
+            actually loads under Python 3.14 free-threaded on Windows where
+            `python3.dll` (the abi3 forwarder) is not present.
+
+            Upstream tracking: <https://github.com/opencv/opencv-python/pull/1051>
+            (pending merge as of build time).
+          files: wheels/*.whl
+          fail_on_unmatched_files: true
