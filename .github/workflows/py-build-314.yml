@@ -51,6 +51,44 @@ jobs:
         shell: bash
         run: uv python install "$PYTHON_VERSION"
 
+      # Workaround scikit-build's stale free-threading detection on Windows:
+      # cp314t ships libs/python314t.lib but scikit-build's CMake config asks
+      # the MSVC linker for python314.lib (the GIL-enabled name). Copy the
+      # t-variant to the standard name. The two .lib files export the same
+      # C API surface — only GIL handling differs, and opencv's C++ doesn't
+      # call GIL functions directly. Remove once scikit-build properly
+      # respects Py_GIL_DISABLED.
+      - name: Workaround scikit-build python314.lib name on cp314t
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pyExe = & uv python find "$env:PYTHON_VERSION"
+          if (-not $pyExe) {
+            Write-Error "uv python find returned empty"
+            exit 1
+          }
+          $pyHome = Split-Path -Parent $pyExe
+          $libsDir = Join-Path $pyHome "libs"
+          Write-Host "Python home: $pyHome"
+          Write-Host "Libs dir contents (before):"
+          Get-ChildItem $libsDir | Format-Table Name, Length
+
+          $sourceLib = Join-Path $libsDir "python314t.lib"
+          $targetLib = Join-Path $libsDir "python314.lib"
+          if (-not (Test-Path $sourceLib)) {
+            Write-Error "python314t.lib not found at $sourceLib"
+            exit 1
+          }
+          if (Test-Path $targetLib) {
+            Write-Host "python314.lib already exists; skipping"
+          } else {
+            Copy-Item $sourceLib $targetLib
+            Write-Host "Copied python314t.lib -> python314.lib"
+          }
+          Write-Host "Libs dir contents (after):"
+          Get-ChildItem $libsDir | Where-Object { $_.Name -like "python31*.lib" } | Format-Table Name, Length
+
       - name: Clone opencv-python with submodules
         shell: bash
         run: |
