@@ -89,6 +89,18 @@ jobs:
           Write-Host "Libs dir contents (after):"
           Get-ChildItem $libsDir | Where-Object { $_.Name -like "python31*.lib" } | Format-Table Name, Length
 
+          # Export paths so the build step can pin Python3_LIBRARY without re-running uv python find.
+          "PY_HOME=$pyHome"      | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+          "PY_LIBS_DIR=$libsDir" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+
+          # MSVC link.exe searches dirs listed in LIB for any *.lib it needs; appending the
+          # cp314t install's libs/ lets it resolve the renamed python314.lib regardless of
+          # what /LIBPATH: scikit-build passes.
+          $existingLib = if ($env:LIB) { $env:LIB } else { "" }
+          $newLib      = if ($existingLib) { "$existingLib;$libsDir" } else { $libsDir }
+          "LIB=$newLib"          | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+          Write-Host "LIB after append: $newLib"
+
       - name: Clone opencv-python with submodules
         shell: bash
         run: |
@@ -148,6 +160,22 @@ jobs:
           # opencv-python's setup.py reads MAKEFLAGS / CMAKE_ARGS too.
           # Limit parallel jobs to avoid OOM on 7 GB runners.
           $env:CMAKE_BUILD_PARALLEL_LEVEL = "4"
+
+          # Override scikit-build's FindPython3 detection so CMake points straight at
+          # python314t.lib instead of asking the linker for a bare python314.lib.
+          # We set every variable scikit-build / opencv's CMake might consult, plus
+          # CMAKE_VERBOSE_MAKEFILE=ON so the link.exe command line shows up in any
+          # future link failure log.
+          $libPath = Join-Path $env:PY_LIBS_DIR "python314t.lib"
+          $incPath = Join-Path $env:PY_HOME    "Include"
+          $env:CMAKE_ARGS = @(
+              "-DPython3_LIBRARY=$libPath",
+              "-DPython3_LIBRARIES=$libPath",
+              "-DPython3_INCLUDE_DIR=$incPath",
+              "-DPYTHON_LIBRARY=$libPath",
+              "-DCMAKE_VERBOSE_MAKEFILE=ON"
+          ) -join " "
+          Write-Host "CMAKE_ARGS: $env:CMAKE_ARGS"
 
           Write-Host "Starting opencv build — expect 20-40 min..."
           .venv\Scripts\python.exe -m build --wheel --no-isolation --outdir dist
