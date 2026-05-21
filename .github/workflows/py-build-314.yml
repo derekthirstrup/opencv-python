@@ -89,15 +89,18 @@ jobs:
           $workdir = "$env:RUNNER_TEMP\opencv-python-build"
           Set-Location "$workdir"
 
-          # Create a cp314t venv with build deps. Cython pin matches what
-          # cupy/fastrlock used; opencv-python's actual build deps come
-          # from its own pyproject.toml. `pip` is required because
-          # opencv-python's setup.py imports it for fetching the opencv
-          # C++ source — uv venvs don't include pip by default.
+          # Create a cp314t venv with build deps. opencv-python's
+          # pyproject.toml pins numpy==2.3.2 and setuptools<70.0.0 for
+          # Python 3.14, and its custom backend at _build_backend/
+          # strictly verifies those exact specs are present. Match them.
+          # numpy 2.3.2 may not have a cp314t wheel on PyPI yet — uv
+          # will source-build it (~5 min) if needed.
+          # `pip` is required because opencv-python's setup.py imports
+          # it; uv venvs don't include pip by default.
           uv venv --python="$env:PYTHON_VERSION" .venv
           uv pip install --python .venv\Scripts\python.exe `
-              pip "cython>=3.1,<3.2" "setuptools>=70" wheel build `
-              "scikit-build>=0.18" numpy cmake ninja
+              pip "cython>=3.1,<3.2" "setuptools<70.0.0" wheel build `
+              "scikit-build>=0.14" "numpy==2.3.2" cmake ninja
 
           # ENABLE_HEADLESS makes setup.py produce opencv-python-headless
           # (the variant BFS2 depends on).
