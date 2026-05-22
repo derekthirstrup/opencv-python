@@ -319,7 +319,8 @@ jobs:
           # pinned, but its __multiarray_api.h produces a broken import_array
           # on cp314t — see issue opencv/opencv-python#1201.)
           uv pip install --python "$pyexe" "numpy==2.4.6" "$GITHUB_WORKSPACE"/dist/*.whl
-          "$pyexe" -m pip list
+          # uv venvs don't ship pip, so use `uv pip list` instead of `python -m pip list`.
+          uv pip list --python "$pyexe"
 
           # First pass: plain import, no -v. If it fails, the traceback is
           # right at the bottom of the output — not buried under Python's
