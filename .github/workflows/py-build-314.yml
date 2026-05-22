@@ -260,6 +260,34 @@ jobs:
               pip "cython>=3.1,<3.2" "setuptools<70.0.0" wheel build `
               "scikit-build>=0.14" "numpy==2.4.6" cmake ninja
 
+          # WORKAROUND for cp314t Windows: numpy 2.4.6's __multiarray_api.h
+          # uses `PyCapsule_CheckExact(c_api)` (a header macro that does
+          # direct `&PyCapsule_Type` pointer-address comparison) to verify
+          # numpy's _ARRAY_API capsule. On free-threaded Python 3.14, the
+          # inlined &PyCapsule_Type address that cv2.pyd sees doesn't match
+          # the one numpy's capsule was tagged with at module init, so the
+          # check fails with `RuntimeError: _ARRAY_API is not PyCapsule
+          # object` — even though `PyCapsule_IsValid()` (a real exported
+          # function in python314t.dll) confirms the capsule is fine.
+          # Rewrite the check to use the exported function instead of the
+          # macro. Both perform the same verification when name=NULL.
+          $apiHeader = ".venv\Lib\site-packages\numpy\_core\include\numpy\__multiarray_api.h"
+          if (-not (Test-Path $apiHeader)) {
+            Write-Error "numpy __multiarray_api.h not found at $apiHeader"
+            exit 1
+          }
+          $content = Get-Content $apiHeader -Raw
+          $old = 'if (!PyCapsule_CheckExact(c_api)) {'
+          $new = 'if (!PyCapsule_IsValid(c_api, NULL)) {'
+          if ($content -notmatch [regex]::Escape($old)) {
+            Write-Error "Expected line `"$old`" not found in $apiHeader"
+            exit 1
+          }
+          $content = $content -replace [regex]::Escape($old), $new
+          Set-Content -Path $apiHeader -Value $content -NoNewline
+          Write-Host "Patched __multiarray_api.h: PyCapsule_CheckExact -> PyCapsule_IsValid(c_api, NULL)"
+          Select-String -Path $apiHeader -Pattern 'PyCapsule_IsValid|PyCapsule_CheckExact' | Select-Object -First 5
+
           # ENABLE_HEADLESS makes setup.py produce opencv-python-headless
           # (the variant BFS2 depends on).
           $env:ENABLE_HEADLESS = "1"
