@@ -177,6 +177,41 @@ jobs:
           echo "--- after ---"
           grep -n 'numpy' "$workdir/pyproject.toml"
 
+      # Also patch setup.py's install_requires (the *runtime* numpy
+      # constraint baked into the wheel's METADATA). Tag 92 ships with a
+      # too-loose `numpy>=2; python_version>="3.9"` that would let
+      # consumers install our cp314t wheel against a numpy 2.3.x that's
+      # known-broken for us. Apply the structure proposed in
+      # opencv/opencv-python#1223 but tighten the 3.14 floor to 2.4.6 to
+      # match what we built against.
+      - name: Patch setup.py install_requires to pin numpy>=2.4.6 on 3.14
+        shell: bash
+        run: |
+          set -euo pipefail
+          workdir="$RUNNER_TEMP/opencv-python-build"
+          echo "--- before ---"
+          grep -n 'numpy' "$workdir/setup.py" | head -10
+          # Replace the single loose pin with a Python-version-specific block.
+          # Use a python helper to do the multi-line replace robustly.
+          python - "$workdir/setup.py" <<'PY'
+          import re, sys
+          path = sys.argv[1]
+          src = open(path, encoding="utf-8").read()
+          old = "    'numpy>=2; python_version>=\"3.9\"',"
+          new = (
+              "    'numpy>=2.0.2; python_version>=\"3.9\" and python_version<\"3.13\"',\n"
+              "    'numpy>=2.1.3; python_version>=\"3.13\" and python_version<\"3.14\"',\n"
+              "    'numpy>=2.4.6; python_version>=\"3.14\"',"
+          )
+          if old not in src:
+              raise SystemExit(f"FATAL: didn't find expected install_requires line in {path}")
+          src = src.replace(old, new)
+          open(path, "w", encoding="utf-8").write(src)
+          print("Patched install_requires.")
+          PY
+          echo "--- after ---"
+          grep -n 'numpy' "$workdir/setup.py" | head -10
+
       - name: Build wheel (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
