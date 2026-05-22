@@ -155,14 +155,48 @@ jobs:
           echo "--- after ---"
           grep -n 'PYTHON3_LIMITED_API' "$workdir/setup.py"
 
+      # CPython's free-threaded Windows installer does not currently expose
+      # `Py_GIL_DISABLED` through pyconfig.h. Build backends must define it
+      # explicitly when compiling extension modules; otherwise Python.h exposes
+      # the regular GIL ABI even though the extension is linked against
+      # python314t.dll. That mismatch is enough to make inlined C-API checks
+      # like PyCapsule_CheckExact disagree with python314t.dll at runtime.
+      #
+      # Scope the define to OpenCV's Python extension target instead of the
+      # whole C++ build.
+      - name: Patch OpenCV Python target to compile with Py_GIL_DISABLED on cp314t
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          workdir="$RUNNER_TEMP/opencv-python-build"
+          target="$workdir/opencv/modules/python/common.cmake"
+          python - "$target" <<'PY'
+          import sys
+          path = sys.argv[1]
+          src = open(path, encoding="utf-8").read()
+          needle = "if(TARGET gen_opencv_python_source)\n"
+          insert = (
+              "# Windows free-threaded CPython installers require extension\n"
+              "# build backends to define Py_GIL_DISABLED explicitly.\n"
+              "target_compile_definitions(${the_module} PRIVATE Py_GIL_DISABLED=1)\n\n"
+          )
+          if insert in src:
+              print("Py_GIL_DISABLED target define already present")
+          elif needle not in src:
+              raise SystemExit(f"FATAL: insertion point not found in {path}")
+          else:
+              src = src.replace(needle, insert + needle, 1)
+              open(path, "w", encoding="utf-8").write(src)
+              print("Patched OpenCV Python target with Py_GIL_DISABLED=1")
+          PY
+          grep -n 'Py_GIL_DISABLED' "$target"
+
       # opencv-python tag 92's pyproject.toml hard-pins `numpy==2.3.2` for
-      # Python 3.14 — and its _build_backend enforces it strictly. But numpy
-      # 2.3.2's __multiarray_api.h header produces a cv2.pyd whose
-      # import_array() macro fails on cp314t with
-      # `RuntimeError: _ARRAY_API is not PyCapsule object` (issue #1201).
-      # NumPy 2.4.6 is the newest version with a cp314t wheel on PyPI and
-      # has the fix; rewrite the pin so the strict check passes and the
-      # build links against working headers.
+      # Python 3.14, and its _build_backend enforces it strictly. Build this
+      # experimental cp314t wheel against the same NumPy version used in the
+      # smoke test so the generated NumPy C-API import code and runtime package
+      # are held constant while validating the Python ABI fix.
       - name: Patch pyproject.toml numpy pin for Python 3.14
         shell: bash
         run: |
@@ -212,16 +246,10 @@ jobs:
           echo "--- after ---"
           grep -n 'numpy' "$workdir/setup.py" | head -10
 
-      # ROOT CAUSE FIX: opencv 4.13.0's cv2.hpp hard-pins itself to the
-      # NumPy 1.7 API (line 37: `#define NPY_NO_DEPRECATED_API
-      # NPY_1_7_API_VERSION`). That makes numpy's headers emit a
-      # 1.x-compat import_array() macro. The compiled cv2.pyd then trips
-      # numpy 2.x's "module compiled against ABI version 1.x" runtime
-      # check, which surfaces as `RuntimeError: _ARRAY_API is not PyCapsule
-      # object` on import. Bump the API target to numpy 2.0 (still well
-      # below 2.4.6 we build against, so no API loss) AND set
-      # NPY_TARGET_VERSION so numpy generates 2.x-ABI code paths. This is
-      # the actual fix for the cp314t/numpy issue.
+      # OpenCV 4.13.0's cv2.hpp hard-pins itself to the NumPy 1.7 API
+      # (line 37: `#define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION`).
+      # Build this cp314t wheel against NumPy's 2.0 feature target instead,
+      # matching the NumPy 2.x-only runtime floor below.
       - name: Patch cv2.hpp NumPy API version to 2.0
         shell: bash
         run: |
@@ -259,34 +287,6 @@ jobs:
           uv pip install --python .venv\Scripts\python.exe `
               pip "cython>=3.1,<3.2" "setuptools<70.0.0" wheel build `
               "scikit-build>=0.14" "numpy==2.4.6" cmake ninja
-
-          # WORKAROUND for cp314t Windows: numpy 2.4.6's __multiarray_api.h
-          # uses `PyCapsule_CheckExact(c_api)` (a header macro that does
-          # direct `&PyCapsule_Type` pointer-address comparison) to verify
-          # numpy's _ARRAY_API capsule. On free-threaded Python 3.14, the
-          # inlined &PyCapsule_Type address that cv2.pyd sees doesn't match
-          # the one numpy's capsule was tagged with at module init, so the
-          # check fails with `RuntimeError: _ARRAY_API is not PyCapsule
-          # object` — even though `PyCapsule_IsValid()` (a real exported
-          # function in python314t.dll) confirms the capsule is fine.
-          # Rewrite the check to use the exported function instead of the
-          # macro. Both perform the same verification when name=NULL.
-          $apiHeader = ".venv\Lib\site-packages\numpy\_core\include\numpy\__multiarray_api.h"
-          if (-not (Test-Path $apiHeader)) {
-            Write-Error "numpy __multiarray_api.h not found at $apiHeader"
-            exit 1
-          }
-          $content = Get-Content $apiHeader -Raw
-          $old = 'if (!PyCapsule_CheckExact(c_api)) {'
-          $new = 'if (!PyCapsule_IsValid(c_api, NULL)) {'
-          if ($content -notmatch [regex]::Escape($old)) {
-            Write-Error "Expected line `"$old`" not found in $apiHeader"
-            exit 1
-          }
-          $content = $content -replace [regex]::Escape($old), $new
-          Set-Content -Path $apiHeader -Value $content -NoNewline
-          Write-Host "Patched __multiarray_api.h: PyCapsule_CheckExact -> PyCapsule_IsValid(c_api, NULL)"
-          Select-String -Path $apiHeader -Pattern 'PyCapsule_IsValid|PyCapsule_CheckExact' | Select-Object -First 5
 
           # ENABLE_HEADLESS makes setup.py produce opencv-python-headless
           # (the variant BFS2 depends on).
@@ -366,13 +366,9 @@ jobs:
             pyexe="$smoke_venv/bin/python"
           fi
           "$pyexe" -VV
-          # Pin numpy to the same version cv2 was compiled against (2.4.6).
-          # The wheel's import_array() macro was baked in from numpy 2.4.6's
-          # headers and only matches a 2.4.6 runtime ABI. BFS2's installer
-          # needs the same constraint when it consumes this wheel.
-          # (numpy 2.3.2 is what opencv-python's pyproject.toml originally
-          # pinned, but its __multiarray_api.h produces a broken import_array
-          # on cp314t — see issue opencv/opencv-python#1201.)
+          # Pin numpy to the same version cv2 was compiled against while this
+          # cp314t wheel is experimental. Once the import smoke test passes,
+          # this can be relaxed to the oldest NumPy 2.x runtime proven to work.
           uv pip install --python "$pyexe" "numpy==2.4.6" "$GITHUB_WORKSPACE"/dist/*.whl
           # uv venvs don't ship pip, so use `uv pip list` instead of `python -m pip list`.
           uv pip list --python "$pyexe"
