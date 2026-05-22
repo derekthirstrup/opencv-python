@@ -166,8 +166,14 @@ jobs:
           # We set every variable scikit-build / opencv's CMake might consult, plus
           # CMAKE_VERBOSE_MAKEFILE=ON so the link.exe command line shows up in any
           # future link failure log.
-          $libPath = Join-Path $env:PY_LIBS_DIR "python314t.lib"
-          $incPath = Join-Path $env:PY_HOME    "Include"
+          #
+          # NB: paths MUST use forward slashes here. scikit-build parses CMAKE_ARGS
+          # with Python's shlex.split(..., posix=True), which silently consumes
+          # backslashes as escape characters — turning C:\Users\... into C:Users...
+          # and producing LNK1181 on a mangled path. CMake on Windows accepts
+          # forward slashes everywhere.
+          $libPath = (Join-Path $env:PY_LIBS_DIR "python314t.lib").Replace('\', '/')
+          $incPath = (Join-Path $env:PY_HOME    "Include").Replace('\', '/')
           $env:CMAKE_ARGS = @(
               "-DPython3_LIBRARY=$libPath",
               "-DPython3_LIBRARIES=$libPath",
