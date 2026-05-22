@@ -89,6 +89,30 @@ jobs:
           Write-Host "Libs dir contents (after):"
           Get-ChildItem $libsDir | Where-Object { $_.Name -like "python31*.lib" } | Format-Table Name, Length
 
+          # The real fix: pyconfig.h contains `#pragma comment(lib, "python314.lib")`,
+          # which the C++ compiler embeds into every .obj that includes Python.h as
+          # an auto-link directive. cp314t doesn't ship python314.lib (only the
+          # `t` variant), so link.exe demands the missing file and fails with
+          # LNK1104 — independent of how we wire Python3_LIBRARY in CMake.
+          # Rewriting the pragma to ask for python314t.lib lets link.exe satisfy
+          # the auto-link from the explicit full-path arg we already pass, so it
+          # no longer searches LIB at all. (LIB env var append below does not
+          # propagate into MSBuild's link.exe process — MSVC's toolset init
+          # resets it.)
+          $pyconfigPath = Join-Path $pyHome "Include\pyconfig.h"
+          if (-not (Test-Path $pyconfigPath)) {
+            Write-Error "pyconfig.h not found at $pyconfigPath"
+            exit 1
+          }
+          $content = Get-Content $pyconfigPath -Raw
+          if ($content -match '"python314\.lib"') {
+            $patched = $content -replace '"python314\.lib"', '"python314t.lib"'
+            Set-Content -Path $pyconfigPath -Value $patched -NoNewline
+            Write-Host "Patched pyconfig.h: rewrote python314.lib -> python314t.lib"
+          } else {
+            Write-Host "pyconfig.h has no literal 'python314.lib' (already patched or freethreaded layout differs)"
+          }
+
           # Export paths so the build step can pin Python3_LIBRARY without re-running uv python find.
           "PY_HOME=$pyHome"      | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
           "PY_LIBS_DIR=$libsDir" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
