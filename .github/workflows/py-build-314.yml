@@ -261,9 +261,28 @@ jobs:
           # BFS2's installer needs the same constraint when it consumes
           # this wheel.
           uv pip install --python "$pyexe" "numpy==2.3.2" "$GITHUB_WORKSPACE"/dist/*.whl
-          # -X faulthandler dumps a C-level traceback on import crashes;
-          # -v shows which DLLs / modules are being loaded.
-          "$pyexe" -I -X faulthandler -v -c "import cv2; print('cv2 ok, version', cv2.__version__)" 2>&1 | tail -200
+          "$pyexe" -m pip list
+
+          # First pass: plain import, no -v. If it fails, the traceback is
+          # right at the bottom of the output — not buried under Python's
+          # interpreter-shutdown spam from -v.
+          echo "=== smoke test (plain) ==="
+          if "$pyexe" -I -X faulthandler -c "import cv2; print('cv2 ok, version', cv2.__version__)"; then
+            echo "=== cv2 imported successfully ==="
+            exit 0
+          fi
+
+          # Second pass on failure: -v dump to a file and surface the
+          # interesting parts (the cleanup phase is huge and pushes the real
+          # error off any reasonable tail).
+          echo "=== plain import failed — re-running with -v for diagnostics ==="
+          vlog="$RUNNER_TEMP/cv2-import.log"
+          "$pyexe" -I -X faulthandler -v -c "import cv2" > "$vlog" 2>&1 || true
+          echo "--- lines matching Error/Traceback/cannot/failed ---"
+          grep -nE "(Error|Traceback|cannot|failed|ImportError|RuntimeError)" "$vlog" | head -80 || true
+          echo "--- last 30 import-tracing lines (just before shutdown) ---"
+          grep -nE "^# (import|load)" "$vlog" | tail -30 || true
+          exit 1
 
       # Run only if the smoke test failed — dump the .pyd's DLL dependencies
       # so we can see what's missing (the most common failure mode is a missing
