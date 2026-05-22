@@ -254,7 +254,13 @@ jobs:
             pyexe="$smoke_venv/bin/python"
           fi
           "$pyexe" -VV
-          uv pip install --python "$pyexe" "$GITHUB_WORKSPACE"/dist/*.whl
+          # Pin numpy to the same version cv2 was compiled against (2.3.2).
+          # NumPy 2.x's "stable ABI" doesn't cover the _ARRAY_API PyCapsule
+          # layout, so running cv2 against a newer numpy minor (e.g. 2.4.x)
+          # fails with `RuntimeError: _ARRAY_API is not PyCapsule object`.
+          # BFS2's installer needs the same constraint when it consumes
+          # this wheel.
+          uv pip install --python "$pyexe" "numpy==2.3.2" "$GITHUB_WORKSPACE"/dist/*.whl
           # -X faulthandler dumps a C-level traceback on import crashes;
           # -v shows which DLLs / modules are being loaded.
           "$pyexe" -I -X faulthandler -v -c "import cv2; print('cv2 ok, version', cv2.__version__)" 2>&1 | tail -200
