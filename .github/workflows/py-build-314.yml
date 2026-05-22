@@ -212,6 +212,33 @@ jobs:
           echo "--- after ---"
           grep -n 'numpy' "$workdir/setup.py" | head -10
 
+      # ROOT CAUSE FIX: opencv 4.13.0's cv2.hpp hard-pins itself to the
+      # NumPy 1.7 API (line 37: `#define NPY_NO_DEPRECATED_API
+      # NPY_1_7_API_VERSION`). That makes numpy's headers emit a
+      # 1.x-compat import_array() macro. The compiled cv2.pyd then trips
+      # numpy 2.x's "module compiled against ABI version 1.x" runtime
+      # check, which surfaces as `RuntimeError: _ARRAY_API is not PyCapsule
+      # object` on import. Bump the API target to numpy 2.0 (still well
+      # below 2.4.6 we build against, so no API loss) AND set
+      # NPY_TARGET_VERSION so numpy generates 2.x-ABI code paths. This is
+      # the actual fix for the cp314t/numpy issue.
+      - name: Patch cv2.hpp NumPy API version to 2.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          workdir="$RUNNER_TEMP/opencv-python-build"
+          target="$workdir/opencv/modules/python/src2/cv2.hpp"
+          echo "--- before ---"
+          grep -n 'NPY_' "$target" || true
+          # Replace the 1.7 pin with 2.0, and also add NPY_TARGET_VERSION
+          # right after it (numpy needs both to fully switch to 2.x ABI).
+          sed -i.bak \
+              's|#define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION|#define NPY_NO_DEPRECATED_API NPY_2_0_API_VERSION\n#define NPY_TARGET_VERSION NPY_2_0_API_VERSION|' \
+              "$target"
+          rm -f "${target}.bak"
+          echo "--- after ---"
+          grep -n 'NPY_' "$target" || true
+
       - name: Build wheel (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
