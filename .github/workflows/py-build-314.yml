@@ -227,6 +227,18 @@ jobs:
             esac
           done
 
+      # Upload the wheel BEFORE the smoke test. The wheel is the deliverable;
+      # smoke test failures (DLL load errors, missing symbols) should not lose
+      # an hour of compile. `if: always()` also covers the case where any later
+      # step in this job fails — the artifact still survives.
+      - name: Upload wheel artifact
+        if: always() && hashFiles('dist/*.whl') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencv-python-headless-${{ matrix.platform_tag }}-cp314t-wheel
+          path: dist/*.whl
+          if-no-files-found: error
+
       # Real smoke test: install in a fresh cp314t venv and import cv2.
       # If the abi3-vs-cp314t fix worked, this load should succeed where
       # the retagged-abi3 wheel failed with "DLL load failed."
@@ -237,19 +249,40 @@ jobs:
           smoke_venv="$RUNNER_TEMP/smoke-venv"
           uv venv --python="$PYTHON_VERSION" "$smoke_venv"
           if [ "$RUNNER_OS" = "Windows" ]; then
-            uv pip install --python "$smoke_venv/Scripts/python.exe" "$GITHUB_WORKSPACE"/dist/*.whl
-            "$smoke_venv/Scripts/python.exe" -I -c "import cv2; print('cv2 ok, version', cv2.__version__)"
+            pyexe="$smoke_venv/Scripts/python.exe"
           else
-            uv pip install --python "$smoke_venv/bin/python" "$GITHUB_WORKSPACE"/dist/*.whl
-            "$smoke_venv/bin/python" -I -c "import cv2; print('cv2 ok, version', cv2.__version__)"
+            pyexe="$smoke_venv/bin/python"
           fi
+          "$pyexe" -VV
+          uv pip install --python "$pyexe" "$GITHUB_WORKSPACE"/dist/*.whl
+          # -X faulthandler dumps a C-level traceback on import crashes;
+          # -v shows which DLLs / modules are being loaded.
+          "$pyexe" -I -X faulthandler -v -c "import cv2; print('cv2 ok, version', cv2.__version__)" 2>&1 | tail -200
 
-      - name: Upload wheel artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: opencv-python-headless-${{ matrix.platform_tag }}-cp314t-wheel
-          path: dist/*.whl
-          if-no-files-found: error
+      # Run only if the smoke test failed — dump the .pyd's DLL dependencies
+      # so we can see what's missing (the most common failure mode is a missing
+      # MSVC runtime or a Windows feature DLL).
+      - name: Diagnose smoke test failure
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $whl = Get-ChildItem "$env:GITHUB_WORKSPACE\dist\*.whl" | Select-Object -First 1
+          if (-not $whl) { Write-Host "no wheel"; exit 0 }
+          $extract = "$env:RUNNER_TEMP\wheel-inspect"
+          if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
+          Expand-Archive -Path $whl.FullName -DestinationPath $extract
+          Write-Host "=== wheel contents (top-level) ==="
+          Get-ChildItem $extract | Format-Table Name, Length
+          $pyd = Get-ChildItem -Path $extract -Filter "cv2*.pyd" -Recurse | Select-Object -First 1
+          if ($pyd) {
+            Write-Host "=== cv2 .pyd: $($pyd.FullName) ($([math]::Round($pyd.Length / 1MB, 1)) MB) ==="
+            $dumpbin = Get-ChildItem -Path "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC" -Filter "dumpbin.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($dumpbin) {
+              Write-Host "=== dumpbin /dependents ==="
+              & $dumpbin.FullName /dependents $pyd.FullName
+            }
+          }
 
   publish-release:
     name: Publish wheels to GitHub Release
